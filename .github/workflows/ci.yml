@@ -1,0 +1,154 @@
+name: Thread Pool CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression-test:
+    name: Java 8 Regression Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java 8
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '8'
+          cache: maven
+
+      - name: Show Java and Maven versions
+        run: |
+          java -version
+          mvn -version
+
+      - name: Run Maven regression tests
+        run: mvn -B clean test
+
+      - name: Validate generated reports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CSV_FILE="target/thread-pool-report/results.csv"
+          JSON_FILE="target/thread-pool-report/results.json"
+
+          test -f "${CSV_FILE}"
+          test -f "${JSON_FILE}"
+
+          CSV_LINES="$(sed -n '$=' "${CSV_FILE}")"
+          echo "CSV logical lines: ${CSV_LINES}"
+
+          test "${CSV_LINES}" -eq 9
+
+          grep -q '^JDK-SATURATION,' "${CSV_FILE}"
+          grep -q '^ABTP-BISS,' "${CSV_FILE}"
+          grep -q '^ABTP-BWS,' "${CSV_FILE}"
+          grep -q '^ABTP-RQS,' "${CSV_FILE}"
+          grep -q '^ABTP-BUFFER-0.0,' "${CSV_FILE}"
+          grep -q '^ABTP-BUFFER-0.5,' "${CSV_FILE}"
+          grep -q '^ABTP-BUFFER-1.0,' "${CSV_FILE}"
+          grep -q '^ABTP-TIMEOUT,' "${CSV_FILE}"
+
+          python3 -m json.tool "${JSON_FILE}" > /dev/null
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report_file = Path(
+              "target/thread-pool-report/results.json"
+          )
+
+          with report_file.open(
+              "r",
+              encoding="utf-8"
+          ) as file:
+              results = json.load(file)
+
+          expected_strategies = {
+              "JDK-SATURATION",
+              "ABTP-BISS",
+              "ABTP-BWS",
+              "ABTP-RQS",
+              "ABTP-BUFFER-0.0",
+              "ABTP-BUFFER-0.5",
+              "ABTP-BUFFER-1.0",
+              "ABTP-TIMEOUT",
+          }
+
+          assert len(results) == 8, (
+              f"Expected 8 results, got {len(results)}"
+          )
+
+          actual_strategies = {
+              result["strategy"]
+              for result in results
+          }
+
+          assert actual_strategies == expected_strategies, (
+              f"Unexpected strategies: {actual_strategies}"
+          )
+
+          for result in results:
+              resolved = (
+                  result["success"]
+                  + result["failed"]
+                  + result["rejected"]
+              )
+
+              assert resolved == result["submitted"], (
+                  f"Accounting mismatch: {result}"
+              )
+
+              assert result["unresolved"] == 0, result
+              assert result["accounted"] is True, result
+              assert result["terminated"] is True, result
+
+          timeout_results = [
+              result
+              for result in results
+              if result["timedOut"]
+          ]
+
+          assert len(timeout_results) == 1
+
+          timeout_result = timeout_results[0]
+
+          assert timeout_result["strategy"] == "ABTP-TIMEOUT"
+          assert timeout_result["submitted"] == 4
+          assert timeout_result["success"] == 0
+          assert timeout_result["failed"] == 4
+          assert timeout_result["rejected"] == 0
+          assert timeout_result["unresolved"] == 0
+
+          bws_result = next(
+              result
+              for result in results
+              if result["strategy"] == "ABTP-BWS"
+          )
+
+          assert bws_result["rejected"] == 0
+          assert bws_result["forceEnqueueCount"] > 0
+          assert bws_result["timedOut"] is False
+
+          print("Thread-pool report validation passed.")
+          PY
+
+      - name: Upload test and experiment reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thread-pool-test-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            target/surefire-reports/
+            target/thread-pool-report/
